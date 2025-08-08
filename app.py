@@ -46,31 +46,64 @@ kw_text = st.text_area("Één per regel", value=default_keywords, height=120)
 keywords: List[str] = [k.strip() for k in kw_text.splitlines() if k.strip()][:5]  # hard limit 5
 
 # Suggestie-actie
+# Suggestie-actie (verbeterd met fallbacks)
 if suggest_btn:
     try:
         pytrends = TrendReq(hl="nl-NL", tz=60)
-        # We gebruiken “related queries” als populaire suggestiebron (NL-markt)
-        pytrends.build_payload([seed], timeframe="today 12-m", geo="NL")
-        related = pytrends.related_queries()
-        # Pak 'top' en 'rising' waar beschikbaar, combineer en dedup
-        cands = []
-        for v in related.values():
-            if v and "top" in v and isinstance(v["top"], pd.DataFrame):
-                cands += v["top"]["query"].tolist()
-            if v and "rising" in v and isinstance(v["rising"], pd.DataFrame):
-                cands += v["rising"]["query"].tolist()
-        # Normaliseer, filter korte/onzin, dedup while preserving order
+        seed_clean = (seed or "").strip()
+
+        candidates = []
+
+        # 1) Probeer related_queries (top/rising) op NL
+        if seed_clean:
+            pytrends.build_payload([seed_clean], timeframe="today 12-m", geo="NL")
+            related = pytrends.related_queries()
+            for v in related.values():
+                if v and "top" in v and isinstance(v["top"], pd.DataFrame):
+                    candidates += v["top"]["query"].tolist()
+                if v and "rising" in v and isinstance(v["rising"], pd.DataFrame):
+                    candidates += v["rising"]["query"].tolist()
+
+        # 2) Fallback: pytrends.suggestions (topics) → pak 'title'
+        if not candidates and seed_clean:
+            sugg = pytrends.suggestions(keyword=seed_clean) or []
+            candidates += [item.get("title", "") for item in sugg if item.get("title")]
+
+        # 3) Fallback: probeer simpele NL-varianten/synoniemen van de seed
+        if not candidates and seed_clean:
+            variants = {
+                "nagelsalon": ["nagelsalon", "nagelstudio", "manicure", "pedicure", "acryl nagels", "gel nagels"],
+                "gym": ["gym", "sportschool", "fitness", "personal trainer", "bootcamp"],
+            }
+            base = variants.get(seed_clean.lower(), [seed_clean, f"{seed_clean} salon", f"{seed_clean} studio"])
+            # Vraag per variant related_queries op en voeg toe
+            for term in base:
+                try:
+                    pytrends.build_payload([term], timeframe="today 12-m", geo="NL")
+                    rel2 = pytrends.related_queries()
+                    for v in rel2.values():
+                        if v and "top" in v and isinstance(v["top"], pd.DataFrame):
+                            candidates += v["top"]["query"].tolist()
+                        if v and "rising" in v and isinstance(v["rising"], pd.DataFrame):
+                            candidates += v["rising"]["query"].tolist()
+                    # Kleine pauze tegen rate limiting
+                    time.sleep(0.5)
+                except Exception:
+                    continue
+
+        # Schoonmaken + dedupliceren
         seen = set()
         cleaned = []
-        for q in cands:
+        for q in candidates:
             qn = str(q).strip()
             if len(qn) < 2:
                 continue
-            if qn.lower() not in seen:
-                seen.add(qn.lower())
+            key = qn.lower()
+            if key not in seen:
+                seen.add(key)
                 cleaned.append(qn)
 
-        # Maak er lokale intent van: voeg “weesp” toe als dat nog niet in de term zit
+        # Lokale intent: voeg 'weesp' toe als die er nog niet in staat
         localised = []
         for q in cleaned:
             if "weesp" not in q.lower():
@@ -78,16 +111,16 @@ if suggest_btn:
             else:
                 localised.append(q)
 
-        # Houd max 5 beste kandidaten
+        # Max 5
         suggested = localised[:5] if localised else []
         if suggested:
-            # Schrijf ze in de textarea
             st.success("Suggesties bijgewerkt.")
             st.session_state["kw_text_override"] = "\n".join(suggested)
         else:
-            st.info("Geen bruikbare NL-suggesties gevonden voor deze seed. Probeer een algemenere term (bv. 'gym').")
+            st.info("Geen bruikbare NL-suggesties gevonden. Probeer een algemenere seed (bv. 'nagelstudio' of 'manicure').")
     except Exception as e:
         st.error(f"Suggesties ophalen mislukt: {e}")
+
 
 # Als we suggesties hebben geplaatst, vervang de textarea inhoud éénmalig
 if "kw_text_override" in st.session_state:
