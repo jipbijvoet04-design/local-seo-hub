@@ -1,25 +1,27 @@
-
 import time
-import json
-import datetime as dt
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 
 GOOGLE_PLACES_TEXTSEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
 
-def text_search(query: str, api_key: str, location: Optional[str], radius: Optional[int], region: Optional[str], language: Optional[str], pagelimit: int = 2) -> List[Dict[str, Any]]:
+def text_search(
+    query: str,
+    api_key: str,
+    region: Optional[str] = None,
+    language: Optional[str] = None,
+    pagelimit: int = 1,
+) -> List[Dict[str, Any]]:
+    """Fetch Google Places Text Search results for a query.
+    We keep this minimal: region/language hints only, 1 page by default.
+    """
     params = {"query": query, "key": api_key}
-    if location:
-        params["location"] = location
-    if radius:
-        params["radius"] = str(radius)
     if region:
         params["region"] = region
     if language:
         params["language"] = language
 
-    all_results = []
+    all_results: List[Dict[str, Any]] = []
     page = 0
     next_page_token = None
 
@@ -48,42 +50,23 @@ def text_search(query: str, api_key: str, location: Optional[str], radius: Optio
 
     return all_results
 
-def find_business_position(results: List[Dict[str, Any]], targets: List[str], target_place_id: Optional[str] = None) -> Optional[int]:
-    targets_norm = [t.strip().lower() for t in targets if t.strip()]
+def _position_in_results(results: List[Dict[str, Any]], label: str, place_id: Optional[str], name_fallback: Optional[str]) -> Optional[int]:
+    """Return 1-based position by exact place_id if provided; otherwise match by normalized name."""
     for idx, item in enumerate(results, start=1):
-        name = (item.get("name") or "").strip().lower()
-        place_id = item.get("place_id")
-        if target_place_id and place_id == target_place_id:
+        if place_id and item.get("place_id") == place_id:
             return idx
-        if name and any(name == t or name.replace(" b.v.", "") == t for t in targets_norm):
-            return idx
+    if name_fallback:
+        target = name_fallback.strip().lower()
+        for idx, item in enumerate(results, start=1):
+            name = (item.get("name") or "").strip().lower()
+            if name == target or name.replace(" b.v.", "") == target:
+                return idx
     return None
 
-def run_keywords(api_key: str, target_names: List[str], keywords: List[str],
-                 city_append: Optional[str], location: Optional[str], radius_m: Optional[int],
-                 region: str, language: str, pagelimit: int, delay_sec: float,
-                 target_place_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    rows = []
-    for kw in keywords:
-        query = kw
-        if city_append and city_append.lower() not in kw.lower():
-            query = f"{kw} {city_append}"
-        results = text_search(query=query, api_key=api_key, location=location, radius=radius_m, region=region, language=language, pagelimit=pagelimit)
-        pos = find_business_position(results, targets=target_names, target_place_id=target_place_id)
-        top10 = [{
-            "name": r.get("name"),
-            "place_id": r.get("place_id"),
-            "rating": r.get("rating"),
-            "user_ratings_total": r.get("user_ratings_total"),
-            "formatted_address": r.get("formatted_address"),
-        } for r in results[:10]]
-        rows.append({
-            "timestamp_utc": now,
-            "keyword": kw,
-            "query_sent": query,
-            "position_maps": pos if pos is not None else "",
-            "top10_snapshot_json": json.dumps(top10, ensure_ascii=False)
-        })
-        time.sleep(delay_sec)
-    return rows
+def find_positions(results: List[Dict[str, Any]], entities: List[Tuple[str, str]]) -> Dict[str, Any]:
+    """entities: list of (label, place_id). Returns mapping label -> position or ''."""
+    out: Dict[str, Any] = {}
+    for (label, pid) in entities:
+        pos = _position_in_results(results, label=label, place_id=(pid or None), name_fallback=label)
+        out[label] = pos if pos is not None else ""
+    return out
