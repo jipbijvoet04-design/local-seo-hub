@@ -1,6 +1,7 @@
 import time
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -9,6 +10,7 @@ from utils import text_search, find_positions
 st.set_page_config(page_title="Local SEO Rank Checker", layout="wide")
 st.title("Local SEO Rank Checker (Google Maps)")
 
+# ============ SIDEBAR INPUTS ============
 with st.sidebar:
     st.header("Your business")
     api_key = st.text_input("Google Places API key", type="password", value=st.secrets.get("GOOGLE_PLACES_API_KEY", ""))
@@ -33,6 +35,7 @@ keywords: List[str] = [k.strip() for k in kw_text.splitlines() if k.strip()][:5]
 
 run_btn = st.button("Run check")
 
+# ============ RUN CHECK ============
 if run_btn:
     # Basic validation
     if not api_key:
@@ -45,14 +48,15 @@ if run_btn:
         st.error("Add at least one keyword (max 5).")
         st.stop()
 
-    # Build the entity list in the order to display
+    # Entities to score, in display order
     entities: List[Tuple[str, str]] = []
-    entities.append((your_name or "You", your_place_id.strip()))
+    your_label = your_name or "You"
+    entities.append((your_label, your_place_id.strip()))
     for (n, pid) in comp_inputs:
         if n or pid:
             entities.append((n or "Competitor", pid))
 
-    # Run per keyword: fetch once, compute positions for all entities
+    # Fetch results once per keyword and compute positions for all entities
     rows: List[Dict[str, str]] = []
     for kw in keywords:
         results = text_search(
@@ -68,13 +72,72 @@ if run_btn:
         rows.append(row)
         time.sleep(1.0)  # fixed delay between keywords
 
-    # Build dataframe with columns in the same order we constructed entities
+    # Build dataframe with consistent column order
     columns = ["keyword"] + [label for (label, _) in entities]
     df = pd.DataFrame(rows, columns=columns)
 
     st.success(f"Completed {len(df)} keyword checks.")
-    st.dataframe(df, use_container_width=True)
 
+    # ============ TABLE WITH CONDITIONAL COLORS ============
+    def color_rank(val: Optional[object]) -> str:
+        # Blank or NaN
+        if val is None or (isinstance(val, float) and np.isnan(val)) or val == "":
+            return "background-color: #ffe5e5"  # light red for not found
+        try:
+            v = int(val)
+        except Exception:
+            return ""
+        if 1 <= v <= 3:
+            return "background-color: #d6f5d6"  # green
+        if 4 <= v <= 10:
+            return "background-color: #fff4cc"  # yellow
+        return "background-color: #ffe5e5"      # red-ish for >10
+
+    # Apply styling (don’t color the keyword column)
+    numeric_cols = [c for c in df.columns if c != "keyword"]
+    styler = df.style.applymap(color_rank, subset=numeric_cols)
+    st.write("### Keyword rankings")
+    st.dataframe(styler, use_container_width=True)
+
+    # ============ MINI DASHBOARD METRICS ============
+    # Convert positions to numeric for summaries
+    df_num = df.copy()
+    for c in numeric_cols:
+        df_num[c] = pd.to_numeric(df_num[c], errors="coerce")
+
+    # Top-3 coverage per business
+    coverage = {c: int((df_num[c].dropna() <= 3).sum()) for c in numeric_cols}
+    cov_df = pd.DataFrame({"Business": list(coverage.keys()), "Top 3 count": list(coverage.values())}).set_index("Business")
+
+    st.write("### Top-3 coverage (per business)")
+    st.bar_chart(cov_df)
+
+    # Average rank badges per business
+    st.write("### Average rank (lower is better)")
+    cols = st.columns(len(numeric_cols))
+    for i, c in enumerate(numeric_cols):
+        avg = df_num[c].mean(skipna=True)
+        label = c
+        if pd.isna(avg):
+            cols[i].metric(label=label, value="—")
+        else:
+            cols[i].metric(label=label, value=f"{avg:.2f}")
+
+    # Best keyword for your business
+    st.write("### Best keyword for your business")
+    best_kw = None
+    best_pos = None
+    if your_label in df_num.columns:
+        series = df_num[your_label]
+        if series.notna().any():
+            best_pos = int(series.min())
+            best_kw = df.loc[series.idxmin(), "keyword"]
+    if best_kw is not None and best_pos is not None:
+        st.success(f"Best keyword: **{best_kw}** — Rank **#{best_pos}**")
+    else:
+        st.info("No best keyword to highlight (not found in first page).")
+
+    # Download
     st.download_button(
         "Download CSV",
         data=df.to_csv(index=False).encode("utf-8"),
@@ -82,4 +145,4 @@ if run_btn:
         mime="text/csv"
     )
 
-    st.caption("Notes: Place IDs ensure exact matching. If a cell is blank, the business was not found on the first page of results for that keyword.")
+    st.caption("Notes: Top-3 (green), 4–10 (yellow), >10 or not found (red). Place IDs ensure exact matching.")
